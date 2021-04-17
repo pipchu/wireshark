@@ -17,6 +17,8 @@
 
 #include <epan/prefs.h>
 
+#include <epan/proto_data.h>
+
 void proto_register_tns(void);
 
 /* Packet Types */
@@ -32,6 +34,7 @@ void proto_register_tns(void);
 #define TNS_TYPE_MARKER         12
 #define TNS_TYPE_ATTENTION      13
 #define TNS_TYPE_CONTROL        14
+#define TNS_TYPE_DESCRIPTOR     15
 #define TNS_TYPE_MAX            19
 
 /* Data Packet Functions */
@@ -246,6 +249,7 @@ static const value_string tns_type_vals[] = {
 	{TNS_TYPE_MARKER,    "Marker"},
 	{TNS_TYPE_ATTENTION, "Attention"},
 	{TNS_TYPE_CONTROL,   "Control"},
+	{TNS_TYPE_DESCRIPTOR,"DataDescriptor"},
 	{0, NULL}
 };
 
@@ -945,11 +949,24 @@ static void dissect_tns_connect(tvbuff_t *tvb, int offset, packet_info *pinfo _U
 	}
 }
 
-static void dissect_tns_accept(tvbuff_t *tvb, int offset, packet_info *pinfo _U_, proto_tree *tns_tree)
+static void dissect_tns_accept(tvbuff_t *tvb, int offset, packet_info *pinfo, proto_tree *tns_tree)
 {
 	proto_tree *accept_tree;
 	guint32 accept_offset, accept_len;
 	int tns_offset = offset-8;
+	conversation_t *conv;
+	gboolean *large_sdu_conv;
+
+	conv = find_or_create_conversation(pinfo);
+	large_sdu_conv = (gboolean *)conversation_get_proto_data(conv, proto_tns);
+	if (large_sdu_conv == NULL) {
+		large_sdu_conv = (gboolean *)wmem_alloc(wmem_file_scope(), sizeof(gboolean));
+		*large_sdu_conv = FALSE;
+		conversation_add_proto_data(conv, proto_tns, large_sdu_conv);
+	}
+	
+	if (tvb_get_ntohs(tvb, offset) >= 315)
+		*large_sdu_conv = TRUE;
 
 	accept_tree = proto_tree_add_subtree(tns_tree, tvb, offset, -1,
 		    ett_tns_accept, NULL, "Accept");
@@ -1104,28 +1121,47 @@ static void dissect_tns_control(tvbuff_t *tvb, int offset, packet_info *pinfo _U
 }
 
 static guint
-get_tns_pdu_len(packet_info *pinfo _U_, tvbuff_t *tvb, int offset, void *data _U_)
+get_tns_pdu_len_bytes(packet_info *pinfo, tvbuff_t *tvb, int offset)
 {
-	/*
-	 * Get the 16-bit length of the TNS message, including header
-	 */
-	return tvb_get_ntohs(tvb, offset);
+	conversation_t *conv;
+	gboolean *large_sdu_conv, *large_sdu_pkt;
+	guint8 type;
+
+	conv = find_or_create_conversation(pinfo);
+	if (PINFO_FD_VISITED(pinfo) == FALSE) {
+		large_sdu_conv = (gboolean *)conversation_get_proto_data(conv, proto_tns);
+		large_sdu_pkt = (gboolean *)wmem_alloc(wmem_file_scope(), sizeof(gboolean));
+		if (large_sdu_conv && *large_sdu_conv)
+			*large_sdu_pkt = TRUE;
+		else
+			*large_sdu_pkt = FALSE;
+		p_add_proto_data(wmem_file_scope(), pinfo, proto_tns, 996, large_sdu_pkt);
+	} else {
+		large_sdu_pkt = (gboolean *)p_get_proto_data(wmem_file_scope(), pinfo, proto_tns, 996);
+	}
+	type = tvb_get_guint8(tvb, offset + 4);
+
+	return (large_sdu_pkt && *large_sdu_pkt &&
+		(type == TNS_TYPE_DATA || type == TNS_TYPE_MARKER || type == TNS_TYPE_CONTROL || type == TNS_TYPE_DESCRIPTOR))
+		? 4
+		: 2;
 }
 
 static guint
-get_tns_pdu_len_nochksum(packet_info *pinfo _U_, tvbuff_t *tvb, int offset, void *data _U_)
+get_tns_pdu_len(packet_info *pinfo, tvbuff_t *tvb, int offset, void *data _U_)
 {
 	/*
-	 * Get the 32-bit length of the TNS message, including header
+	 * Get the 16/32-bit length of the TNS message, including header
 	 */
-	return tvb_get_ntohl(tvb, offset);
+	return (get_tns_pdu_len_bytes(pinfo, tvb, offset) == 4)
+		? tvb_get_ntohl(tvb, offset)
+		: tvb_get_ntohs(tvb, offset);
 }
 
 static int
 dissect_tns(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 {
 	guint32 length;
-	guint16 chksum;
 	guint8  type;
 
 	/*
@@ -1153,12 +1189,10 @@ dissect_tns(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 	 * Else, Oracle 12c combine these two 16-bit numbers into one 32-bit.
 	 * This number represents the packet length. Checksum is omitted.
 	 */
-	chksum = tvb_get_ntohs(tvb, 2);
-
-	length = (chksum == 0 || chksum == 4) ? 2 : 4;
+	length = get_tns_pdu_len_bytes(pinfo, tvb, 0);
 
 	tcp_dissect_pdus(tvb, pinfo, tree, tns_desegment, length,
-			(length == 2 ? get_tns_pdu_len : get_tns_pdu_len_nochksum),
+			get_tns_pdu_len,
 			dissect_tns_pdu, data);
 
 	return tvb_captured_length(tvb);
@@ -1171,7 +1205,6 @@ dissect_tns_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data 
 	proto_item *hidden_item;
 	int offset = 0;
 	guint32 length;
-	guint16 chksum;
 	guint8  type;
 
 	col_set_str(pinfo->cinfo, COL_PROTOCOL, "TNS");
@@ -1194,8 +1227,7 @@ dissect_tns_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data 
 	}
 	proto_item_set_hidden(hidden_item);
 
-	chksum = tvb_get_ntohs(tvb, offset+2);
-	if (chksum == 0 || chksum == 4)
+	if (get_tns_pdu_len_bytes(pinfo, tvb, 0) == 2)
 	{
 		proto_tree_add_item_ret_uint(tns_tree, hf_tns_length, tvb, offset,
 					2, ENC_BIG_ENDIAN, &length);
